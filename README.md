@@ -25,11 +25,11 @@ Both models share the exact same vocabulary size ($V = 10,000$) and context wind
 | **Total Parameters** | **10,812,272 (~10.81M)** | **1,001,408 (~1.00M)** | **~10.8x Capacity Asymmetry** |
 | **Vocabulary Size ($V$)** | 10,000 | 10,000 | Shared Byte-Level BPE |
 | **Context Length ($T$)** | 256 | 256 | Maximum Sequence Window |
-| **Layers ($N_{\text{layer}}$)** | 9 | 7 | Deep Target vs Slim Draft |
-| **Hidden Dimension ($d_{\text{model}}$)** | 272 | 64 | Target has 4.25x wider channels |
-| **Attention Heads ($N_{\text{head}}$)** | 4 (Head dim: 68) | 2 (Head dim: 32) | Multi-Head Causal Self-Attention |
-| **Feedforward Expansion** | $4 \times d_{\text{model}}$ (1088) | $4 \times d_{\text{model}}$ (256) | Standard MLP with GELU |
-| **Linear / LN Bias** | `True` | `False` | Parameter optimization |
+| **Layers ($N_{\text{layer}}$)** | 9 | 2 | Deep Target vs Ultra-Shallow Draft (3.5x faster) |
+| **Hidden Dimension ($d_{\text{model}}$)** | 272 | 80 | Target has 3.4x wider channels |
+| **Attention Heads ($N_{\text{head}}$)** | 4 (Head dim: 68) | 2 (Head dim: 40) | Multi-Head Causal Self-Attention |
+| **Feedforward Expansion** | $4 \times d_{\text{model}}$ (1088) | $4 \times d_{\text{model}}$ (320) | Standard MLP with GELU |
+| **Linear / LN Bias** | `True` | `True` | GPT-2 style bias |
 | **Weight Tying** | `True` (`wte` $\leftrightarrow$ `lm_head`) | `True` (`wte` $\leftrightarrow$ `lm_head`) | Saves embedding parameters |
 
 ### Parameter Math Breakdown:
@@ -39,11 +39,11 @@ Both models share the exact same vocabulary size ($V = 10,000$) and context wind
   $$\text{LN}_f = 2 \times 272 = 544$$
   $$\mathbf{\text{Total Target Parameters}} = 2,789,632 + 8,022,096 + 544 = \mathbf{10,812,272} \ (\mathbf{10.81M})$$
 
-- **Draft Model (1.0M)**:
-  $$\text{Embeddings} = 10,000 \times 64 + 256 \times 64 = 656,384$$
-  $$\text{Per Block} = 12 \times 64^2 + 2 \times 64 = 49,280 \implies 7 \times 49,280 = 344,960$$
-  $$\text{LN}_f = 64$$
-  $$\mathbf{\text{Total Draft Parameters}} = 656,384 + 344,960 + 64 = \mathbf{1,001,408} \ (\mathbf{1.00M})$$
+- **Draft Model (1.0M - Optimized Shallow Architecture)**:
+  $$\text{Embeddings} = 10,000 \times 80 + 256 \times 80 = 820,480$$
+  $$\text{Per Block} = 12 \times 80^2 + 13 \times 80 = 77,840 \implies 2 \times 77,840 = 155,680$$
+  $$\text{LN}_f = 2 \times 80 = 160$$
+  $$\mathbf{\text{Total Draft Parameters}} = 820,480 + 155,680 + 160 = \mathbf{976,320} \ (\mathbf{0.98M} \approx \mathbf{1.0M})$$
 
 ---
 

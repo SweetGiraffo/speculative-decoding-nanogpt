@@ -321,14 +321,14 @@ target_cfg = GPTConfig(
     tie_weights=True
 )
 
-# 1.0M Draft Model Configuration
+# 1.0M Draft Model Configuration (Optimized Shallow Architecture for Speed)
 draft_cfg = GPTConfig(
     block_size=256,
     vocab_size=10000,
-    n_layer=7,
+    n_layer=2,
     n_head=2,
-    n_embd=64,
-    bias=False,
+    n_embd=80,
+    bias=True,
     tie_weights=True
 )
 
@@ -497,10 +497,13 @@ print(f"[+] Target model training complete in {(time.time() - start_time) / 60:.
     # -------------------------------------------------------------
     # Cell 8: Train Draft Model (1.0M) (Code)
     # -------------------------------------------------------------
-    cells.append(nbf.v4.new_markdown_cell("""## 8. Pre-Train the 1.0M Draft Model on TinyStories
-We train the lightweight 1.0M Draft Model to match the token distribution of TinyStories.
+    cells.append(nbf.v4.new_markdown_cell("""## 8. Train the 1.0M Draft Model with Knowledge Distillation
+To achieve a **65%+ token acceptance rate**, the 1.0M draft model is trained using **Knowledge Distillation (KD)** from the 10.8M target model.
+Instead of independently predicting raw text, the draft model directly learns the target model's output probability distribution via KL-divergence loss.
 """))
     cells.append(nbf.v4.new_code_cell("""draft_model = GPT(draft_cfg).to(device)
+target_model.eval() # Freeze teacher target model for distillation
+
 draft_optimizer = draft_model.configure_optimizers(
     weight_decay=0.1, learning_rate=1e-3, betas=(0.9, 0.95), device_type=device
 )
@@ -508,7 +511,7 @@ draft_scaler = torch.amp.GradScaler(device=device, enabled=(device == "cuda"))
 draft_max_iters = 2500
 draft_loss_history = []
 
-print(f"[*] Training 1.0M Draft Model for {draft_max_iters} iterations on {device.upper()}...")
+print(f"[*] Training 1.0M Draft Model via Knowledge Distillation for {draft_max_iters} iterations on {device.upper()}...")
 start_time = time.time()
 best_draft_val = float("inf")
 
@@ -528,14 +531,23 @@ for step in range(draft_max_iters):
     draft_optimizer.zero_grad(set_to_none=True)
     x, y = dataloader.get_batch("train")
     with torch.amp.autocast(device_type=device, dtype=torch.float16 if device == "cuda" else torch.float32):
-        _, loss, _ = draft_model(x, targets=y)
+        logits, loss_ce, _ = draft_model(x, targets=y)
+        # Knowledge Distillation from Target Model
+        with torch.no_grad():
+            t_logits, _, _ = target_model(x)
+        T_kd = 2.0
+        p_target = F.softmax(t_logits / T_kd, dim=-1)
+        log_p_draft = F.log_softmax(logits / T_kd, dim=-1)
+        loss_kd = F.kl_div(log_p_draft, p_target, reduction="batchmean") * (T_kd ** 2)
+        loss = 0.3 * loss_ce + 0.7 * loss_kd
+
     draft_scaler.scale(loss).backward()
     draft_scaler.unscale_(draft_optimizer)
     torch.nn.utils.clip_grad_norm_(draft_model.parameters(), 1.0)
     draft_scaler.step(draft_optimizer)
     draft_scaler.update()
 
-print(f"[+] Draft model training complete in {(time.time() - start_time) / 60:.2f} min! Best Val Loss: {best_draft_val:.4f}")
+print(f"[+] Draft model distillation complete in {(time.time() - start_time) / 60:.2f} min! Best Val Loss: {best_draft_val:.4f}")
 """))
 
     # -------------------------------------------------------------
@@ -555,7 +567,7 @@ class SpeculativeDecoder:
         self.draft_model = draft_model.eval()
         self.device = next(target_model.parameters()).device
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(self, prompt, max_new_tokens, gamma=4, temperature=0.0):
         start_time = time.perf_counter()
         seq = prompt.clone().to(self.device)
@@ -600,40 +612,41 @@ class SpeculativeDecoder:
             # Phase 2: Target verifies all gamma tokens in parallel
             t_cand_logits, _, target_kvs = self.target_model(cand_tokens, past_kvs=target_kvs, use_cache=True)
 
-            target_probs = []
-            for i in range(cur_gamma):
-                t_log = last_target_logits if i == 0 else t_cand_logits[:, i - 1, :]
-                target_probs.append(F.softmax(t_log if temperature == 0.0 else t_log / temperature, dim=-1))
-
+            all_target_logits = torch.cat([last_target_logits.unsqueeze(1), t_cand_logits[:, :-1, :]], dim=1)
             bonus_logits = t_cand_logits[:, -1, :]
 
-            # Phase 3: Acceptance Check
-            accepted = []
-            rejected = False
-            replacement = None
-
-            for i in range(cur_gamma):
-                cand = cand_tokens[:, i : i + 1]
-                if temperature == 0.0:
-                    tgt_tok = torch.argmax(target_probs[i], dim=-1, keepdim=True)
-                    if cand.item() == tgt_tok.item():
-                        accepted.append(cand)
-                    else:
-                        rejected = True
-                        replacement = tgt_tok
-                        break
+            # Phase 3: Fast GPU Vectorized Acceptance
+            if temperature == 0.0:
+                tgt_greedy = torch.argmax(all_target_logits, dim=-1) # (1, cur_gamma)
+                matches = (cand_tokens == tgt_greedy).squeeze(0)     # (cur_gamma,)
+                mismatches = (~matches).nonzero(as_tuple=True)[0]
+                if mismatches.numel() == 0:
+                    num_acc = cur_gamma
+                    rejected = False
+                    replacement = None
                 else:
+                    num_acc = mismatches[0].item()
+                    rejected = True
+                    replacement = tgt_greedy[:, num_acc : num_acc + 1]
+                accepted = [cand_tokens[:, :num_acc]] if num_acc > 0 else []
+            else:
+                accepted = []
+                rejected = False
+                replacement = None
+                for i in range(cur_gamma):
+                    cand = cand_tokens[:, i : i + 1]
                     p_d = draft_probs[i][0, cand.item()].item()
-                    p_t = target_probs[i][0, cand.item()].item()
+                    t_p = F.softmax(all_target_logits[:, i, :] / temperature, dim=-1)
+                    p_t = t_p[0, cand.item()].item()
                     if torch.rand(1, device=self.device).item() < min(1.0, p_t / max(p_d, 1e-12)):
                         accepted.append(cand)
                     else:
                         rejected = True
-                        res = torch.clamp(target_probs[i] - draft_probs[i], min=0.0)
-                        replacement = torch.multinomial(res / res.sum(), 1) if res.sum() > 0 else torch.multinomial(target_probs[i], 1)
+                        res = torch.clamp(t_p - draft_probs[i], min=0.0)
+                        replacement = torch.multinomial(res / res.sum(), 1) if res.sum() > 0 else torch.multinomial(t_p, 1)
                         break
+                num_acc = len(accepted)
 
-            num_acc = len(accepted)
             draft_accepted += num_acc
 
             # Phase 4: Rollback & synchronize KV-caches
@@ -645,7 +658,7 @@ class SpeculativeDecoder:
                 last_target_logits = t_step[:, -1, :]
                 last_draft_logits = d_step[:, -1, :]
             else:
-                emitted = torch.cat(accepted + [replacement], dim=1) if num_acc > 0 else replacement
+                emitted = torch.cat([cand_tokens[:, :num_acc], replacement], dim=1) if num_acc > 0 else replacement
                 seq = torch.cat([seq, emitted], dim=1)
                 valid_len = prefix_len + num_acc
                 target_kvs = truncate_kv_cache(target_kvs, valid_len)

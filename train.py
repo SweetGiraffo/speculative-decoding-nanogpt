@@ -70,6 +70,7 @@ def train(
     grad_clip: float = 1.0,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     dry_run: bool = False,
+    teacher_ckpt: Optional[str] = None,
 ):
     """
     Main training execution function.
@@ -122,6 +123,21 @@ def train(
         else (torch.float16 if device_type == "cuda" else torch.float32)
     )
 
+    # Optional teacher model for Knowledge Distillation (KD)
+    teacher_model = None
+    if model_type.lower() == "draft":
+        default_teacher_path = os.path.join(out_dir, "target_10.8M.pt")
+        teacher_path = teacher_ckpt if teacher_ckpt is not None else default_teacher_path
+        if os.path.exists(teacher_path):
+            print(f"[+] Loading 10.8M Target Teacher from {teacher_path} for Knowledge Distillation...")
+            t_cfg = get_target_config()
+            teacher_model = GPT(t_cfg).to(device)
+            ckpt = torch.load(teacher_path, map_location=device)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            teacher_model.load_state_dict(state_dict)
+            teacher_model.eval()
+            print("[+] Distillation enabled: Student draft model will align with target model distribution!")
+
     best_val_loss = float("inf")
     start_time = time.time()
     iters = 2 if dry_run else max_iters
@@ -160,7 +176,15 @@ def train(
         for micro_step in range(gradient_accumulation_steps):
             x, y = dataloader.get_batch("train")
             with torch.amp.autocast(device_type=device_type, dtype=dtype):
-                _, loss, _ = model(x, targets=y)
+                logits, loss, _ = model(x, targets=y)
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        t_logits, _, _ = teacher_model(x)
+                    T_kd = 2.0
+                    p_target = F.softmax(t_logits / T_kd, dim=-1)
+                    log_p_draft = F.log_softmax(logits / T_kd, dim=-1)
+                    loss_kd = F.kl_div(log_p_draft, p_target, reduction="batchmean") * (T_kd ** 2)
+                    loss = 0.3 * loss + 0.7 * loss_kd
                 loss = loss / gradient_accumulation_steps
             accum_loss += loss.item()
             scaler.scale(loss).backward()
@@ -193,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--warmup_iters", type=int, default=500)
     parser.add_argument("--eval_interval", type=int, default=250)
+    parser.add_argument("--teacher_ckpt", type=str, default=None)
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
@@ -206,5 +231,6 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         warmup_iters=args.warmup_iters,
         eval_interval=args.eval_interval,
+        teacher_ckpt=args.teacher_ckpt,
         dry_run=args.dry_run,
     )

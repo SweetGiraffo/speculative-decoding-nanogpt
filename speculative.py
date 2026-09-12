@@ -4,8 +4,9 @@ Based on Leviathan et al. (2023) and Chen et al. (2023).
 
 Strategically pairs a 10.8M parameter Target Model with a 1.0M parameter Draft Model.
 Features:
-- Fast autoregressive candidate generation with Draft Model (gamma tokens via draft KV-cache)
+- Fast autoregressive candidate generation with shallow Draft Model (gamma tokens via KV-cache)
 - Parallel multi-token verification with Target Model in a single forward pass
+- Vectorized GPU acceptance checking without CPU-GPU synchronization stalls
 - Probabilistic rejection sampling ensuring exact distribution equivalence
 - Deterministic greedy speculative decoding mode (temperature = 0)
 - Accurate Key-Value (KV) cache rollback & truncation upon token rejection
@@ -61,14 +62,10 @@ def truncate_kv_cache(
     """
     Truncates a list of (key, value) cache tuples across all transformer layers
     to target_len along the sequence dimension (dim=2).
-    Used during speculative rejection sampling rollback.
     """
     if past_kvs is None:
         return None
-    truncated = []
-    for k, v in past_kvs:
-        truncated.append((k[:, :, :target_len, :], v[:, :, :target_len, :]))
-    return truncated
+    return [(k[:, :, :target_len, :], v[:, :, :target_len, :]) for k, v in past_kvs]
 
 
 class SpeculativeDecoder:
@@ -80,50 +77,34 @@ class SpeculativeDecoder:
         self.target_model = target_model
         self.draft_model = draft_model
 
-        # Ensure both models reside on the same device and precision
         self.device = next(target_model.parameters()).device
         self.target_model.eval()
         self.draft_model.eval()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         prompt_tokens: torch.Tensor,
         max_new_tokens: int,
         gamma: int = 4,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, SpeculativeMetrics]:
         """
-        Executes speculative decoding generation.
-        
-        Args:
-            prompt_tokens: Tensor of token IDs (1, seq_len)
-            max_new_tokens: Maximum number of tokens to generate
-            gamma: Lookahead budget (number of candidate tokens proposed by draft model)
-            temperature: Sampling temperature (0.0 for deterministic greedy decoding)
-            top_k: Optional top-k filtering
-            
-        Returns:
-            Tuple of (generated_sequence_tokens, speculative_metrics)
+        High-performance speculative decoding with vectorized verification.
         """
         start_time = time.perf_counter()
         seq = prompt_tokens.clone().to(self.device)
         prompt_len = seq.size(1)
         tokens_target_total = prompt_len + max_new_tokens
 
-        # Metrics accumulators
         metrics = SpeculativeMetrics()
 
-        # Step 0: Initial prompt prefill for both target and draft models
-        # Target model prefill
+        # Step 0: Initial prompt prefill
         target_logits, _, target_kvs = self.target_model(seq, use_cache=True)
         metrics.target_forward_passes += 1
-        
-        # Draft model prefill
         draft_logits, _, draft_kvs = self.draft_model(seq, use_cache=True)
 
-        # Logits for the next token after prompt
         last_target_logits = target_logits[:, -1, :]  # (1, vocab_size)
         last_draft_logits = draft_logits[:, -1, :]    # (1, vocab_size)
 
@@ -131,12 +112,10 @@ class SpeculativeDecoder:
             current_prefix_len = seq.size(1)
             metrics.speculative_cycles += 1
 
-            # Adjust gamma if nearing maximum token budget
-            remaining_tokens = tokens_target_total - current_prefix_len
-            current_gamma = min(gamma, remaining_tokens)
+            current_gamma = min(gamma, tokens_target_total - current_prefix_len)
 
             # -------------------------------------------------------------
-            # Phase 1: Draft Model Proposes `current_gamma` Speculative Tokens
+            # Phase 1: Fast Autoregressive Draft Generation
             # -------------------------------------------------------------
             draft_tokens = []
             draft_probs_list = []
@@ -144,7 +123,6 @@ class SpeculativeDecoder:
 
             for _ in range(current_gamma):
                 if temperature == 0.0:
-                    # Greedy draft prediction
                     next_tok = torch.argmax(cur_draft_logits, dim=-1, keepdim=True)
                     draft_p = F.softmax(cur_draft_logits, dim=-1)
                 else:
@@ -158,97 +136,92 @@ class SpeculativeDecoder:
                 draft_tokens.append(next_tok)
                 draft_probs_list.append(draft_p)
 
-                # Forward single draft token to update draft KV cache
                 step_logits, _, draft_kvs = self.draft_model(
                     next_tok, past_kvs=draft_kvs, use_cache=True
                 )
                 cur_draft_logits = step_logits[:, -1, :]
 
-            # Concatenate proposed candidate tokens: shape (1, current_gamma)
-            candidate_tokens = torch.cat(draft_tokens, dim=1)
+            candidate_tokens = torch.cat(draft_tokens, dim=1)  # (1, current_gamma)
             metrics.total_draft_tokens_proposed += current_gamma
 
             # -------------------------------------------------------------
-            # Phase 2: Target Model Parallel Verification (Single Forward Pass)
+            # Phase 2: Target Model Parallel Verification (Single Pass)
             # -------------------------------------------------------------
-            # Pass all gamma candidate tokens simultaneously into target model
             target_cand_logits, _, target_kvs = self.target_model(
                 candidate_tokens, past_kvs=target_kvs, use_cache=True
             )
             metrics.target_forward_passes += 1
 
-            # Target logits at each position:
-            # - Position 0 in target_cand_logits was predicted from last_target_logits!
-            # - Position i (for i >= 1) is target_cand_logits[:, i - 1, :]
-            # - Target bonus logit at end of candidate window is target_cand_logits[:, -1, :]
-            target_probs_list = []
-            for i in range(current_gamma):
-                t_logits = last_target_logits if i == 0 else target_cand_logits[:, i - 1, :]
-                if temperature == 0.0:
-                    t_probs = F.softmax(t_logits, dim=-1)
-                else:
-                    scaled_t = t_logits / temperature
-                    if top_k is not None:
-                        v, _ = torch.topk(scaled_t, min(top_k, scaled_t.size(-1)))
-                        scaled_t[scaled_t < v[:, [-1]]] = -float("Inf")
-                    t_probs = F.softmax(scaled_t, dim=-1)
-                target_probs_list.append(t_probs)
-
-            # Bonus logits at position current_gamma
+            # Assemble target prediction logits for all candidate positions
+            # Candidate 0 is verified by last_target_logits
+            # Candidate i (i >= 1) is verified by target_cand_logits[:, i - 1, :]
+            # Bonus token is from target_cand_logits[:, -1, :]
+            all_target_cand_logits = torch.cat(
+                [last_target_logits.unsqueeze(1), target_cand_logits[:, :-1, :]], dim=1
+            )  # (1, current_gamma, vocab_size)
             bonus_target_logits = target_cand_logits[:, -1, :]
 
             # -------------------------------------------------------------
-            # Phase 3: Rejection Sampling & Acceptance Verification
+            # Phase 3: Vectorized Rejection Sampling & Acceptance
             # -------------------------------------------------------------
-            accepted_tokens = []
-            rejection_occurred = False
-            replacement_token = None
+            if temperature == 0.0:
+                # Fast vectorized greedy verification on GPU
+                target_greedy_preds = torch.argmax(all_target_cand_logits, dim=-1)  # (1, current_gamma)
+                matches = (candidate_tokens == target_greedy_preds).squeeze(0)      # (current_gamma,)
 
-            for i in range(current_gamma):
-                cand_tok = candidate_tokens[:, i : i + 1]  # (1, 1)
-                cand_idx = cand_tok.item()
-                p_draft = draft_probs_list[i][0, cand_idx].item()
-                p_target = target_probs_list[i][0, cand_idx].item()
-
-                if temperature == 0.0:
-                    # Greedy match criterion: target argmax must match draft token
-                    target_greedy_tok = torch.argmax(target_probs_list[i], dim=-1, keepdim=True)
-                    if cand_tok.item() == target_greedy_tok.item():
-                        accepted_tokens.append(cand_tok)
-                    else:
-                        rejection_occurred = True
-                        replacement_token = target_greedy_tok
-                        break
+                # Find first mismatch
+                mismatches = (~matches).nonzero(as_tuple=True)[0]
+                if mismatches.numel() == 0:
+                    num_accepted = current_gamma
+                    rejection_occurred = False
+                    replacement_token = None
                 else:
-                    # Probabilistic Rejection Sampling: Leviathan et al.
-                    accept_prob = min(1.0, p_target / max(p_draft, 1e-12))
-                    rand_val = torch.rand(1, device=self.device).item()
+                    num_accepted = mismatches[0].item()
+                    rejection_occurred = True
+                    replacement_token = target_greedy_preds[:, num_accepted : num_accepted + 1]
 
-                    if rand_val < accept_prob:
-                        # Candidate token ACCEPTED
+                accepted_tokens = [candidate_tokens[:, :num_accepted]] if num_accepted > 0 else []
+
+            else:
+                # Probabilistic Rejection Sampling
+                accepted_tokens = []
+                rejection_occurred = False
+                replacement_token = None
+
+                for i in range(current_gamma):
+                    cand_tok = candidate_tokens[:, i : i + 1]
+                    cand_idx = cand_tok.item()
+                    p_d = draft_probs_list[i][0, cand_idx].item()
+
+                    t_log = all_target_cand_logits[:, i, :] / temperature
+                    if top_k is not None:
+                        v, _ = torch.topk(t_log, min(top_k, t_log.size(-1)))
+                        t_log[t_log < v[:, [-1]]] = -float("Inf")
+                    t_probs = F.softmax(t_log, dim=-1)
+                    p_t = t_probs[0, cand_idx].item()
+
+                    accept_prob = min(1.0, p_t / max(p_d, 1e-12))
+                    if torch.rand(1, device=self.device).item() < accept_prob:
                         accepted_tokens.append(cand_tok)
                     else:
-                        # Candidate token REJECTED: sample replacement from (p_target - p_draft)+
                         rejection_occurred = True
-                        residual = torch.clamp(target_probs_list[i] - draft_probs_list[i], min=0.0)
-                        res_sum = residual.sum(dim=-1, keepdim=True)
+                        res = torch.clamp(t_probs - draft_probs_list[i], min=0.0)
+                        res_sum = res.sum(dim=-1, keepdim=True)
                         if res_sum.item() > 0:
-                            residual_dist = residual / res_sum
-                            replacement_token = torch.multinomial(residual_dist, num_samples=1)
+                            replacement_token = torch.multinomial(res / res_sum, 1)
                         else:
-                            # Fallback to target distribution directly
-                            replacement_token = torch.multinomial(target_probs_list[i], num_samples=1)
+                            replacement_token = torch.multinomial(t_probs, 1)
                         break
 
-            num_accepted = len(accepted_tokens)
+                num_accepted = len(accepted_tokens)
+
             metrics.total_draft_tokens_accepted += num_accepted
 
             # -------------------------------------------------------------
             # Phase 4: KV-Cache Rollback and State Synchronization
             # -------------------------------------------------------------
             if not rejection_occurred:
-                # All gamma candidate tokens were accepted!
-                # Sample bonus token from bonus_target_logits
+                # All gamma candidates accepted! Bonus token sampled from target end logit
                 if temperature == 0.0:
                     bonus_token = torch.argmax(bonus_target_logits, dim=-1, keepdim=True)
                 else:
@@ -259,57 +232,38 @@ class SpeculativeDecoder:
                     bonus_probs = F.softmax(scaled_bonus, dim=-1)
                     bonus_token = torch.multinomial(bonus_probs, num_samples=1)
 
-                all_emitted = torch.cat(accepted_tokens + [bonus_token], dim=1)
-                seq = torch.cat([seq, all_emitted], dim=1)
+                seq = torch.cat([seq, candidate_tokens, bonus_token], dim=1)
 
-                # Update target KV-cache by feeding the bonus token
-                bonus_target_step, _, target_kvs = self.target_model(
-                    bonus_token, past_kvs=target_kvs, use_cache=True
-                )
+                # Update caches with bonus token
+                b_t_step, _, target_kvs = self.target_model(bonus_token, past_kvs=target_kvs, use_cache=True)
                 metrics.target_forward_passes += 1
-                last_target_logits = bonus_target_step[:, -1, :]
-
-                # Feed the bonus token to draft model to advance its cache to match
-                draft_bonus_step, _, draft_kvs = self.draft_model(
-                    bonus_token, past_kvs=draft_kvs, use_cache=True
-                )
-                last_draft_logits = draft_bonus_step[:, -1, :]
+                b_d_step, _, draft_kvs = self.draft_model(bonus_token, past_kvs=draft_kvs, use_cache=True)
+                last_target_logits = b_t_step[:, -1, :]
+                last_draft_logits = b_d_step[:, -1, :]
 
             else:
-                # Token at index `num_accepted` was rejected and replaced
-                all_emitted = (
-                    torch.cat(accepted_tokens + [replacement_token], dim=1)
+                emitted = (
+                    torch.cat([candidate_tokens[:, :num_accepted], replacement_token], dim=1)
                     if num_accepted > 0
                     else replacement_token
                 )
-                seq = torch.cat([seq, all_emitted], dim=1)
+                seq = torch.cat([seq, emitted], dim=1)
 
-                # True accepted length before replacement token
                 valid_len = current_prefix_len + num_accepted
-
-                # Roll back Target KV cache to valid_len
                 target_kvs = truncate_kv_cache(target_kvs, valid_len)
-                # Feed replacement token into Target model
-                t_step, _, target_kvs = self.target_model(
-                    replacement_token, past_kvs=target_kvs, use_cache=True
-                )
-                metrics.target_forward_passes += 1
-                last_target_logits = t_step[:, -1, :]
-
-                # Roll back Draft KV cache to valid_len
                 draft_kvs = truncate_kv_cache(draft_kvs, valid_len)
-                # Feed replacement token into Draft model to synchronize
-                d_step, _, draft_kvs = self.draft_model(
-                    replacement_token, past_kvs=draft_kvs, use_cache=True
-                )
+
+                # Feed replacement token to synchronize
+                t_step, _, target_kvs = self.target_model(replacement_token, past_kvs=target_kvs, use_cache=True)
+                metrics.target_forward_passes += 1
+                d_step, _, draft_kvs = self.draft_model(replacement_token, past_kvs=draft_kvs, use_cache=True)
+                last_target_logits = t_step[:, -1, :]
                 last_draft_logits = d_step[:, -1, :]
 
-        # Slice sequence to exactly max_new_tokens beyond prompt
         final_seq = seq[:, :tokens_target_total]
         elapsed = time.perf_counter() - start_time
         gen_tokens = final_seq.size(1) - prompt_len
 
-        # Populate summary metrics
         metrics.total_tokens_generated = gen_tokens
         metrics.wall_clock_time_sec = elapsed
         metrics.tokens_per_second = gen_tokens / max(elapsed, 1e-6)
@@ -322,21 +276,14 @@ class SpeculativeDecoder:
 
         return final_seq, metrics
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def autoregressive_baseline(
         self,
         prompt_tokens: torch.Tensor,
         max_new_tokens: int,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: Optional[int] = None,
     ) -> Tuple[torch.Tensor, float, float]:
-        """
-        Runs standard autoregressive generation using the 10.8M Target model alone
-        with KV caching, to establish ground-truth wall-clock baseline.
-        
-        Returns:
-            Tuple of (output_sequence, elapsed_seconds, tokens_per_second)
-        """
         start_time = time.perf_counter()
         out_tokens = self.target_model.generate(
             prompt_tokens.clone().to(self.device),
