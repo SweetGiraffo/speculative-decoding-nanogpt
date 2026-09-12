@@ -307,8 +307,8 @@ print("[+] Transformer architecture with KV-caching ready!")
     # -------------------------------------------------------------
     cells.append(nbf.v4.new_markdown_cell("""## 4. Parameter Counts Verification
 We instantiate both models and verify their parameter counts:
-- **Target Model**: **10.8M parameters** ($L=9, D=272, H=4, V=10000$)
-- **Draft Model**: **1.0M parameters** ($L=7, D=64, H=2, V=10000$)
+- **Target Model**: **10.8M parameters** ($L=9, D=272, H=4, V=10000$) -> 10,812,272 parameters
+- **Draft Model**: **1.0M parameters** ($L=1, D=88, H=2, V=10000$) -> 996,776 parameters (~1.0M)
 """))
     cells.append(nbf.v4.new_code_cell("""# 10.8M Target Model Configuration
 target_cfg = GPTConfig(
@@ -325,9 +325,9 @@ target_cfg = GPTConfig(
 draft_cfg = GPTConfig(
     block_size=256,
     vocab_size=10000,
-    n_layer=2,
+    n_layer=1,
     n_head=2,
-    n_embd=80,
+    n_embd=88,
     bias=True,
     tie_weights=True
 )
@@ -555,6 +555,7 @@ print(f"[+] Draft model distillation complete in {(time.time() - start_time) / 6
     # -------------------------------------------------------------
     cells.append(nbf.v4.new_markdown_cell("""## 9. Speculative Decoding Engine
 Implements the Leviathan rejection sampling criterion and KV-cache rollback mechanism.
+Optimized with strictly **ONE target model forward pass per cycle**, GPU-vectorized token matching, and accurate per-token acceptance rate telemetry.
 """))
     cells.append(nbf.v4.new_code_cell("""def truncate_kv_cache(past_kvs, target_len):
     if past_kvs is None:
@@ -568,7 +569,9 @@ class SpeculativeDecoder:
         self.device = next(target_model.parameters()).device
 
     @torch.inference_mode()
-    def generate(self, prompt, max_new_tokens, gamma=4, temperature=0.0):
+    def generate(self, prompt, max_new_tokens, gamma=3, temperature=0.0):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         start_time = time.perf_counter()
         seq = prompt.clone().to(self.device)
         prompt_len = seq.size(1)
@@ -579,17 +582,20 @@ class SpeculativeDecoder:
         draft_logits, _, draft_kvs = self.draft_model(seq, use_cache=True)
         last_target_logits = target_logits[:, -1, :]
         last_draft_logits = draft_logits[:, -1, :]
+        pending_target_token = None
 
         draft_proposed = 0
+        draft_evaluated = 0
         draft_accepted = 0
         cycles = 0
+        target_forward_passes = 1
 
         while seq.size(1) < total_len:
             cycles += 1
             cur_gamma = min(gamma, total_len - seq.size(1))
             prefix_len = seq.size(1)
 
-            # Phase 1: Draft proposes gamma tokens
+            # Phase 1: Fast Autoregressive Draft Generation (1-layer model)
             draft_tokens = []
             draft_probs = []
             cur_logits = last_draft_logits
@@ -609,11 +615,19 @@ class SpeculativeDecoder:
             cand_tokens = torch.cat(draft_tokens, dim=1)
             draft_proposed += cur_gamma
 
-            # Phase 2: Target verifies all gamma tokens in parallel
-            t_cand_logits, _, target_kvs = self.target_model(cand_tokens, past_kvs=target_kvs, use_cache=True)
-
-            all_target_logits = torch.cat([last_target_logits.unsqueeze(1), t_cand_logits[:, :-1, :]], dim=1)
-            bonus_logits = t_cand_logits[:, -1, :]
+            # Phase 2: Target Parallel Verification (STRICTLY 1 PASS PER CYCLE)
+            if pending_target_token is None:
+                # Cycle 1: KV cache covers prompt from prefill
+                t_cand_logits, _, target_kvs = self.target_model(cand_tokens, past_kvs=target_kvs, use_cache=True)
+                all_target_logits = torch.cat([last_target_logits.unsqueeze(1), t_cand_logits[:, :-1, :]], dim=1)
+                bonus_logits = t_cand_logits[:, -1, :]
+            else:
+                # Cycle >= 2: Prepend previous cycle's emitted token; processes [pending, cand_tokens] together!
+                tokens_to_target = torch.cat([pending_target_token, cand_tokens], dim=1)
+                t_cand_logits, _, target_kvs = self.target_model(tokens_to_target, past_kvs=target_kvs, use_cache=True)
+                all_target_logits = t_cand_logits[:, :-1, :]
+                bonus_logits = t_cand_logits[:, -1, :]
+            target_forward_passes += 1
 
             # Phase 3: Fast GPU Vectorized Acceptance
             if temperature == 0.0:
@@ -622,10 +636,12 @@ class SpeculativeDecoder:
                 mismatches = (~matches).nonzero(as_tuple=True)[0]
                 if mismatches.numel() == 0:
                     num_acc = cur_gamma
+                    num_eval = cur_gamma
                     rejected = False
                     replacement = None
                 else:
                     num_acc = mismatches[0].item()
+                    num_eval = num_acc + 1
                     rejected = True
                     replacement = tgt_greedy[:, num_acc : num_acc + 1]
                 accepted = [cand_tokens[:, :num_acc]] if num_acc > 0 else []
@@ -633,7 +649,9 @@ class SpeculativeDecoder:
                 accepted = []
                 rejected = False
                 replacement = None
+                num_eval = 0
                 for i in range(cur_gamma):
+                    num_eval += 1
                     cand = cand_tokens[:, i : i + 1]
                     p_d = draft_probs[i][0, cand.item()].item()
                     t_p = F.softmax(all_target_logits[:, i, :] / temperature, dim=-1)
@@ -647,15 +665,15 @@ class SpeculativeDecoder:
                         break
                 num_acc = len(accepted)
 
+            draft_evaluated += num_eval
             draft_accepted += num_acc
 
-            # Phase 4: Rollback & synchronize KV-caches
+            # Phase 4: KV-Cache Truncation & State Synchronization (Target is NOT run here!)
             if not rejected:
                 bonus = torch.argmax(bonus_logits, dim=-1, keepdim=True) if temperature == 0.0 else torch.multinomial(F.softmax(bonus_logits / max(temperature, 1e-6), dim=-1), 1)
                 seq = torch.cat([seq, cand_tokens, bonus], dim=1)
-                t_step, _, target_kvs = self.target_model(bonus, past_kvs=target_kvs, use_cache=True)
+                pending_target_token = bonus
                 d_step, _, draft_kvs = self.draft_model(bonus, past_kvs=draft_kvs, use_cache=True)
-                last_target_logits = t_step[:, -1, :]
                 last_draft_logits = d_step[:, -1, :]
             else:
                 emitted = torch.cat([cand_tokens[:, :num_acc], replacement], dim=1) if num_acc > 0 else replacement
@@ -663,20 +681,24 @@ class SpeculativeDecoder:
                 valid_len = prefix_len + num_acc
                 target_kvs = truncate_kv_cache(target_kvs, valid_len)
                 draft_kvs = truncate_kv_cache(draft_kvs, valid_len)
-                t_step, _, target_kvs = self.target_model(replacement, past_kvs=target_kvs, use_cache=True)
+                pending_target_token = replacement
                 d_step, _, draft_kvs = self.draft_model(replacement, past_kvs=draft_kvs, use_cache=True)
-                last_target_logits = t_step[:, -1, :]
                 last_draft_logits = d_step[:, -1, :]
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         elapsed = time.perf_counter() - start_time
-        gen_tokens = seq.size(1) - prompt_len
-        acc_rate = (draft_accepted / max(draft_proposed, 1))
-        return seq[:, :total_len], {
+        final_seq = seq[:, :total_len]
+        gen_tokens = final_seq.size(1) - prompt_len
+        acc_rate = (draft_accepted / max(draft_evaluated, 1))
+        return final_seq, {
             "elapsed": elapsed,
             "tps": gen_tokens / elapsed,
             "acceptance_rate": acc_rate,
+            "slot_efficiency": draft_accepted / max(draft_proposed, 1),
             "cycles": cycles,
-            "gen_tokens": gen_tokens
+            "gen_tokens": gen_tokens,
+            "target_forward_passes": target_forward_passes
         }
 
 print("[+] Speculative Decoding engine ready!")
@@ -688,7 +710,7 @@ print("[+] Speculative Decoding engine ready!")
     cells.append(nbf.v4.new_markdown_cell("""## 10. Head-to-Head Benchmark: Baseline vs Speculative Decoding
 We compare the inference speed of:
 - **Baseline**: 10.8M Target Model alone with KV-cache
-- **Speculative**: 10.8M Target + 1.0M Draft with KV-cache
+- **Speculative**: 10.8M Target + 1.0M Draft with KV-cache (strictly 1 target forward pass per cycle)
 """))
     cells.append(nbf.v4.new_code_cell("""decoder = SpeculativeDecoder(target_model, draft_model)
 
@@ -699,22 +721,36 @@ benchmark_prompts = [
     "Mia and her brother loved to bake cookies with their mother."
 ]
 
-benchmark_results = []
-print("=" * 70)
-print(f"{'Prompt':<10} | {'Base Time':<10} | {'Spec Time':<10} | {'Acc Rate':<10} | {'Speedup':<8}")
-print("-" * 70)
+# --- GPU Warm-Up Pass ---
+# Crucial on Colab GPU to initialize CUDA execution contexts & cuBLAS handles
+warmup_ids = torch.tensor([[100, 200, 300]], dtype=torch.long, device=device)
+_ = target_model.generate(warmup_ids, max_new_tokens=10, temperature=0.0, use_cache=True)
+_ = decoder.generate(warmup_ids, max_new_tokens=10, gamma=3, temperature=0.0)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
 
+print("=" * 72)
+print("  HEAD-TO-HEAD BENCHMARK: 10.8M BASELINE vs SPECULATIVE (10.8M + 1.0M)")
+print("=" * 72)
+print(f"{'Prompt':<10} | {'Base Time':<10} | {'Spec Time':<10} | {'Acc Rate':<10} | {'Speedup':<8}")
+print("-" * 72)
+
+benchmark_results = []
 for idx, prompt_text in enumerate(benchmark_prompts):
     p_ids = bpe.encode(prompt_text).ids
     p_tensor = torch.tensor([p_ids], dtype=torch.long, device=device)
 
     # 1. Autoregressive Baseline
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     _ = target_model.generate(p_tensor, max_new_tokens=100, temperature=0.0, use_cache=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     base_time = time.perf_counter() - t0
 
-    # 2. Speculative Decoding
-    _, stats = decoder.generate(p_tensor, max_new_tokens=100, gamma=4, temperature=0.0)
+    # 2. Speculative Decoding (strictly 1 target pass / cycle, gamma=3)
+    _, stats = decoder.generate(p_tensor, max_new_tokens=100, gamma=3, temperature=0.0)
     spec_time = stats["elapsed"]
     speedup = base_time / max(spec_time, 1e-6)
 
@@ -730,9 +766,10 @@ for idx, prompt_text in enumerate(benchmark_prompts):
 
 avg_speedup = sum(r['speedup'] for r in benchmark_results) / len(benchmark_results)
 avg_acc = sum(r['acc_rate'] for r in benchmark_results) / len(benchmark_results)
-print("=" * 70)
-print(f"Average Acceptance Rate: {avg_acc:.1f}%")
-print(f"Average Speedup Factor : {avg_speedup:.2f}x")
+print("=" * 72)
+print(f"Average Token Acceptance Rate : {avg_acc:.1f}%")
+print(f"Average Wall-Clock Speedup    : {avg_speedup:.2f}x")
+print("=" * 72)
 """))
 
     # -------------------------------------------------------------
