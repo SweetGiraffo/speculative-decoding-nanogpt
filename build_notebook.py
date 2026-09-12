@@ -629,18 +629,17 @@ class SpeculativeDecoder:
                 bonus_logits = t_cand_logits[:, -1, :]
             target_forward_passes += 1
 
-            # Phase 3: Fast GPU Vectorized Acceptance
+            # Phase 3: Fast GPU Vectorized Acceptance via cumprod
             if temperature == 0.0:
                 tgt_greedy = torch.argmax(all_target_logits, dim=-1) # (1, cur_gamma)
-                matches = (cand_tokens == tgt_greedy).squeeze(0)     # (cur_gamma,)
-                mismatches = (~matches).nonzero(as_tuple=True)[0]
-                if mismatches.numel() == 0:
-                    num_acc = cur_gamma
+                matches = (cand_tokens == tgt_greedy)[0]             # (cur_gamma,)
+                num_acc = torch.cumprod(matches.long(), dim=0).sum().item()
+
+                if num_acc == cur_gamma:
                     num_eval = cur_gamma
                     rejected = False
                     replacement = None
                 else:
-                    num_acc = mismatches[0].item()
                     num_eval = num_acc + 1
                     rejected = True
                     replacement = tgt_greedy[:, num_acc : num_acc + 1]

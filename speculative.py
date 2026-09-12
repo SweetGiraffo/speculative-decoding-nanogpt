@@ -177,18 +177,16 @@ class SpeculativeDecoder:
             # Phase 3: Vectorized Rejection Sampling & Acceptance
             # -------------------------------------------------------------
             if temperature == 0.0:
-                # Fast GPU vectorized greedy verification
+                # Fast GPU vectorized greedy verification via cumprod
                 target_greedy_preds = torch.argmax(all_target_cand_logits, dim=-1)  # (1, current_gamma)
-                matches = (candidate_tokens == target_greedy_preds).squeeze(0)      # (current_gamma,)
+                matches = (candidate_tokens == target_greedy_preds)[0]              # (current_gamma,)
+                num_accepted = torch.cumprod(matches.long(), dim=0).sum().item()
 
-                mismatches = (~matches).nonzero(as_tuple=True)[0]
-                if mismatches.numel() == 0:
-                    num_accepted = current_gamma
+                if num_accepted == current_gamma:
                     num_evaluated = current_gamma
                     rejection_occurred = False
                     replacement_token = None
                 else:
-                    num_accepted = mismatches[0].item()
                     num_evaluated = num_accepted + 1
                     rejection_occurred = True
                     replacement_token = target_greedy_preds[:, num_accepted : num_accepted + 1]
