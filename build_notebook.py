@@ -155,18 +155,18 @@ class CausalSelfAttention(nn.Module):
                 q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=(T > 1)
             )
         else:
+            dropout_p = self.dropout if self.training else 0.0
             if T == 1:
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-                att = F.softmax(att, dim=-1)
-                y = att @ v
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False
+                )
             else:
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
                 q_indices = torch.arange(past_len, total_kv_len, device=x.device).unsqueeze(1)
                 k_indices = torch.arange(0, total_kv_len, device=x.device).unsqueeze(0)
-                causal_mask = (k_indices <= q_indices)
-                att = att.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-                att = F.softmax(att, dim=-1)
-                y = att @ v
+                causal_mask = (k_indices <= q_indices).unsqueeze(0).unsqueeze(0)
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_mask, dropout_p=dropout_p, is_causal=False
+                )
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))

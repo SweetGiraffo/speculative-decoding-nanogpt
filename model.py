@@ -99,28 +99,21 @@ class CausalSelfAttention(nn.Module):
                 is_causal=is_causal
             )
         else:
-            # Incremental generation with KV cache
+            # Incremental generation with KV cache using fused scaled_dot_product_attention
+            dropout_p = self.dropout if self.training else 0.0
             if T == 1:
-                # Single new token attending to all past tokens + itself: no future mask needed
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-                att = F.softmax(att, dim=-1)
-                if self.training and self.dropout > 0:
-                    att = self.attn_dropout(att)
-                y = att @ v
+                # Single new token attending to all past tokens + itself: all keys <= current pos
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False
+                )
             else:
                 # Multi-token speculative verification (T candidate tokens) over past prefix
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))  # (B, nh, T, total_kv_len)
-                
-                # Causal mask: query i at position (past_len + i) can attend to keys <= (past_len + i)
                 q_indices = torch.arange(past_len, total_kv_len, device=x.device).unsqueeze(1)  # (T, 1)
                 k_indices = torch.arange(0, total_kv_len, device=x.device).unsqueeze(0)        # (1, total_kv_len)
-                causal_mask = (k_indices <= q_indices)  # (T, total_kv_len)
-                
-                att = att.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-                att = F.softmax(att, dim=-1)
-                if self.training and self.dropout > 0:
-                    att = self.attn_dropout(att)
-                y = att @ v
+                causal_mask = (k_indices <= q_indices).unsqueeze(0).unsqueeze(0)                # (1, 1, T, total_kv_len)
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=causal_mask, dropout_p=dropout_p, is_causal=False
+                )
 
         # Re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
